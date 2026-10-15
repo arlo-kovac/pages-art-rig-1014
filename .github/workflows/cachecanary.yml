@@ -1,0 +1,21 @@
+name: cachecanary
+on:
+  workflow_dispatch: {}
+permissions:
+  contents: read
+  actions: write
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    steps:
+      - name: make a payload to cache
+        run: |
+          mkdir -p cachedir
+          printf 'CACHE-CANARY-%s\n' "${GITHUB_RUN_ID}" > cachedir/canary.txt
+      - name: write a cache entry
+        uses: actions/cache@v4
+        with:
+          path: cachedir
+          key: canary-${{ github.run_id }}
+      - name: prove it from inside the run too
+        run: echo "ARM-DONE run=${GITHUB_RUN_ID} key=canary-${GITHUB_RUN_ID}"
