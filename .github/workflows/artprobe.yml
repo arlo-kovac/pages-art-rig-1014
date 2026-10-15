@@ -1,0 +1,30 @@
+name: artprobe
+on:
+  workflow_dispatch: {}
+permissions:
+  id-token: write
+  pages: write
+  contents: read
+  actions: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build a deliberately MALFORMED github-pages artifact
+        run: |
+          mkdir -p art
+          printf 'NOT-A-TAR-CANARY-%s\n' "${GITHUB_RUN_ID}" > art/notatar.txt
+          ls -l art
+      - id: up
+        uses: actions/upload-artifact@v4
+        with:
+          name: github-pages
+          path: art
+          retention-days: 1
+      - name: ARMS
+        env:
+          ART_ID: ${{ steps.up.outputs.artifact-id }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SINK: ${{ secrets.OOB_SINK }}
+        run: python3 probe.py
